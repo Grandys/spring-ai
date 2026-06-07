@@ -42,6 +42,7 @@ import org.springframework.ai.chat.model.Generation;
 import org.springframework.ai.chat.prompt.Prompt;
 import org.springframework.ai.model.tool.DefaultToolCallingChatOptions;
 import org.springframework.ai.model.tool.DefaultToolExecutionResult;
+import org.springframework.ai.model.tool.ToolCallingChatOptions;
 import org.springframework.ai.model.tool.ToolCallingManager;
 import org.springframework.ai.tool.ToolCallback;
 import org.springframework.ai.tool.function.FunctionToolCallback;
@@ -207,14 +208,19 @@ class ToolCallingAdvisorAutoRegistrationTests {
 		}
 
 		@Test
-		void doesNotAutoRegisterWhenNoTools() {
-			stubSingleCallCycle();
+		void autoRegistersWhenToolsInjectedByAdvisor() {
+			stubTwoCallCycle();
 
 			var counter = new ChainIterationCountingAdvisor();
-			ChatClient.create(chatModel).prompt().advisors(counter).user("hello").call().content();
+			ChatClient.create(chatModel)
+				.prompt()
+				.advisors(new DynamicToolRegistrationAdvisor(weatherTool), counter)
+				.user("weather?")
+				.call()
+				.content();
 
-			assertThat(counter.getCallCount()).isEqualTo(1);
-			verify(chatModel, times(1)).call(any(Prompt.class));
+			assertThat(counter.getCallCount()).isGreaterThanOrEqualTo(2);
+			verify(chatModel, times(2)).call(any(Prompt.class));
 		}
 
 		@Test
@@ -342,9 +348,8 @@ class ToolCallingAdvisorAutoRegistrationTests {
 			var counter = new ChainIterationCountingAdvisor();
 			String content = ChatClient.create(chatModel)
 				.prompt()
-				.advisors(counter)
+				.advisors(new DynamicToolRegistrationAdvisor(weatherTool), counter)
 				.user("weather?")
-				.tools(weatherTool)
 				.stream()
 				.content()
 				.collectList()
@@ -354,6 +359,7 @@ class ToolCallingAdvisorAutoRegistrationTests {
 
 			assertThat(content).isNotBlank();
 			assertThat(counter.getCallCount()).isGreaterThanOrEqualTo(2);
+			verify(chatModel, times(2)).stream(any(Prompt.class));
 		}
 
 		@Test
@@ -427,6 +433,36 @@ class ToolCallingAdvisorAutoRegistrationTests {
 
 		List<ChatClientRequest> getCapturedRequests() {
 			return Collections.unmodifiableList(this.capturedRequests);
+		}
+
+	}
+
+	static class DynamicToolRegistrationAdvisor implements BaseAdvisor {
+
+		private final List<ToolCallback> toolCallbacks;
+
+		DynamicToolRegistrationAdvisor(ToolCallback... toolCallbacks) {
+			this.toolCallbacks = List.of(toolCallbacks);
+		}
+
+		@Override
+		public ChatClientRequest before(ChatClientRequest request, AdvisorChain advisorChain) {
+			ToolCallingChatOptions.Builder<?> optionsBuilder = (ToolCallingChatOptions.Builder<?>) request.prompt()
+				.getOptions()
+				.mutate();
+			optionsBuilder.toolCallbacks(this.toolCallbacks);
+			Prompt prompt = new Prompt(request.prompt().getInstructions(), optionsBuilder.build());
+			return request.mutate().prompt(prompt).build();
+		}
+
+		@Override
+		public ChatClientResponse after(ChatClientResponse response, AdvisorChain advisorChain) {
+			return response;
+		}
+
+		@Override
+		public int getOrder() {
+			return ToolCallingAdvisor.DEFAULT_ORDER - 100;
 		}
 
 	}

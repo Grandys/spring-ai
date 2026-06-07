@@ -43,7 +43,11 @@ import org.springframework.ai.chat.client.advisor.ToolCallingAdvisor;
 import org.springframework.ai.chat.client.advisor.api.Advisor;
 import org.springframework.ai.chat.client.advisor.api.BaseAdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.BaseChatMemoryAdvisor;
+import org.springframework.ai.chat.client.advisor.api.CallAdvisor;
+import org.springframework.ai.chat.client.advisor.api.CallAdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.MemoryAdvisor;
+import org.springframework.ai.chat.client.advisor.api.StreamAdvisor;
+import org.springframework.ai.chat.client.advisor.api.StreamAdvisorChain;
 import org.springframework.ai.chat.client.advisor.api.ToolAdvisor;
 import org.springframework.ai.chat.client.advisor.observation.AdvisorObservationConvention;
 import org.springframework.ai.chat.client.observation.ChatClientObservationContext;
@@ -760,6 +764,106 @@ public class DefaultChatClient implements ChatClient {
 
 	}
 
+	private static final class AutoRegisteredToolCallingAdvisor implements CallAdvisor, StreamAdvisor, ToolAdvisor {
+
+		private final ToolCallingAdvisor delegate;
+
+		private AutoRegisteredToolCallingAdvisor(ToolCallingAdvisor delegate) {
+			this.delegate = delegate;
+		}
+
+		@Override
+		public ChatClientResponse adviseCall(ChatClientRequest chatClientRequest, CallAdvisorChain callAdvisorChain) {
+			if (!(chatClientRequest.prompt().getOptions() instanceof ToolCallingChatOptions)) {
+				return callAdvisorChain.nextCall(chatClientRequest);
+			}
+			return this.delegate.adviseCall(chatClientRequest, new DelegateAwareCallAdvisorChain(callAdvisorChain));
+		}
+
+		@Override
+		public Flux<ChatClientResponse> adviseStream(ChatClientRequest chatClientRequest,
+				StreamAdvisorChain streamAdvisorChain) {
+			if (!(chatClientRequest.prompt().getOptions() instanceof ToolCallingChatOptions)) {
+				return streamAdvisorChain.nextStream(chatClientRequest);
+			}
+			return this.delegate.adviseStream(chatClientRequest,
+					new DelegateAwareStreamAdvisorChain(streamAdvisorChain));
+		}
+
+		@Override
+		public String getName() {
+			return this.delegate.getName();
+		}
+
+		@Override
+		public int getOrder() {
+			return this.delegate.getOrder();
+		}
+
+		private final class DelegateAwareCallAdvisorChain implements CallAdvisorChain {
+
+			private final CallAdvisorChain callAdvisorChain;
+
+			private DelegateAwareCallAdvisorChain(CallAdvisorChain callAdvisorChain) {
+				this.callAdvisorChain = callAdvisorChain;
+			}
+
+			@Override
+			public ChatClientResponse nextCall(ChatClientRequest chatClientRequest) {
+				return this.callAdvisorChain.nextCall(chatClientRequest);
+			}
+
+			@Override
+			public List<CallAdvisor> getCallAdvisors() {
+				return this.callAdvisorChain.getCallAdvisors();
+			}
+
+			@Override
+			public CallAdvisorChain copy(CallAdvisor after) {
+				return this.callAdvisorChain.copy(after == AutoRegisteredToolCallingAdvisor.this.delegate
+						? AutoRegisteredToolCallingAdvisor.this : after);
+			}
+
+			@Override
+			public ObservationRegistry getObservationRegistry() {
+				return this.callAdvisorChain.getObservationRegistry();
+			}
+
+		}
+
+		private final class DelegateAwareStreamAdvisorChain implements StreamAdvisorChain {
+
+			private final StreamAdvisorChain streamAdvisorChain;
+
+			private DelegateAwareStreamAdvisorChain(StreamAdvisorChain streamAdvisorChain) {
+				this.streamAdvisorChain = streamAdvisorChain;
+			}
+
+			@Override
+			public Flux<ChatClientResponse> nextStream(ChatClientRequest chatClientRequest) {
+				return this.streamAdvisorChain.nextStream(chatClientRequest);
+			}
+
+			@Override
+			public List<StreamAdvisor> getStreamAdvisors() {
+				return this.streamAdvisorChain.getStreamAdvisors();
+			}
+
+			@Override
+			public StreamAdvisorChain copy(StreamAdvisor after) {
+				return this.streamAdvisorChain.copy(after == AutoRegisteredToolCallingAdvisor.this.delegate
+						? AutoRegisteredToolCallingAdvisor.this : after);
+			}
+
+			@Override
+			public ObservationRegistry getObservationRegistry() {
+				return this.streamAdvisorChain.getObservationRegistry();
+			}
+
+		}
+
+	}
+
 	public static class DefaultChatClientRequestSpec implements ChatClientRequestSpec {
 
 		private final ObservationRegistry observationRegistry;
@@ -1205,11 +1309,12 @@ public class DefaultChatClient implements ChatClient {
 		}
 
 		/**
-		 * Auto-registers a {@link ToolCallingAdvisor} when tools are configured but no
-		 * {@link ToolAdvisor} is present. Disables the advisor's internal conversation
-		 * history when a {@link BaseChatMemoryAdvisor} with a higher order (i.e.
-		 * downstream in the request direction) is already registered, since that memory
-		 * advisor will handle history for every tool-call iteration.
+		 * Auto-registers a {@link ToolCallingAdvisor} when auto-registration is enabled
+		 * and no {@link ToolAdvisor} is present, allowing earlier advisors in the chain
+		 * to provide tools dynamically at request time. Disables the advisor's internal
+		 * conversation history when a {@link BaseChatMemoryAdvisor} with a higher order
+		 * (i.e. downstream in the request direction) is already registered, since that
+		 * memory advisor will handle history for every tool-call iteration.
 		 * <p>
 		 * {@code streamToolCallResponses} must be pre-configured on the
 		 * {@code toolCallingAdvisorBuilder} passed to {@link DefaultChatClient}.
@@ -1219,13 +1324,6 @@ public class DefaultChatClient implements ChatClient {
 			boolean autoRegisterDisabled = Boolean.FALSE
 				.equals(this.advisorParams.get(ChatClientAttributes.TOOL_CALLING_ADVISOR_AUTO_REGISTER.getKey()));
 			if (autoRegisterDisabled) {
-				return;
-			}
-
-			boolean hasTools = !this.toolCallbacks.isEmpty() || !this.toolCallbackProviders.isEmpty()
-					|| hasToolsInChatOptions(this.optionsCustomizer)
-					|| hasToolsInChatOptions(this.chatModel.getOptions());
-			if (!hasTools) {
 				return;
 			}
 
@@ -1239,20 +1337,10 @@ public class DefaultChatClient implements ChatClient {
 			boolean hasDownstreamMemoryAdvisor = this.advisors.stream()
 				.anyMatch(a -> a instanceof MemoryAdvisor && a.getOrder() > configuredOrder);
 
-			this.advisors.add(this.toolCallingAdvisorBuilder.copy()
+			ToolCallingAdvisor toolCallingAdvisor = this.toolCallingAdvisorBuilder.copy()
 				.conversationHistoryEnabled(!hasDownstreamMemoryAdvisor)
-				.build());
-		}
-
-		private static boolean hasToolsInChatOptions(@Nullable Object options) {
-			ToolCallingChatOptions tco = null;
-			if (options instanceof ToolCallingChatOptions direct) {
-				tco = direct;
-			}
-			else if (options instanceof ToolCallingChatOptions.Builder<?> builder) {
-				tco = (ToolCallingChatOptions) builder.build();
-			}
-			return tco != null && ((tco.getToolCallbacks() != null && !tco.getToolCallbacks().isEmpty()));
+				.build();
+			this.advisors.add(new AutoRegisteredToolCallingAdvisor(toolCallingAdvisor));
 		}
 
 		private void validateSingleToolAdvisor() {
